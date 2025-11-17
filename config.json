@@ -1,0 +1,13 @@
+{
+  "paths": {
+    "raw_data": "C:\\__DATASETS_COIRON_PERIODICOS",
+    "intermediate_loaded": "C:\\__DATASETS_COIRON\\1_loaded",
+    "intermediate_processed": "C:\\__DATASETS_COIRON\\2_processed",
+    "intermediate_analytical": "C:\\__DATASETS_COIRON\\3_analytical",
+    "output_reports": "C:\\__DATASETS_COIRON\\4_output"
+  },
+  "filters": {
+    "date_start": "2018-01-01T00:00:00",
+    "date_end": "2025-12-31T00:00:00"
+  }
+}
