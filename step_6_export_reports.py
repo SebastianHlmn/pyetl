@@ -1,9 +1,4 @@
-"""
-step_6_export_reports.py
-
-Paso 6: Carga la base "Atlas" del Paso 3 y genera los reportes
-finales en CSV y Excel para el usuario.
-"""
+# step_6_export_reports.py
 import pandas as pd
 import numpy as np
 import os
@@ -12,8 +7,7 @@ import sys
 import psutil
 import gc
 import json 
-import traceback 
-from datetime import datetime
+import math 
 
 # --- Constantes ---
 LOG_DIR = "logs"
@@ -23,19 +17,20 @@ PAUSE_FILE = os.path.join(LOG_DIR, "step_6.pause")
 RUNNING_FLAG = os.path.join(LOG_DIR, "step_6.running")
 METRICS_FILE = os.path.join(LOG_DIR, "step_6_metrics.json")
 CONFIG_FILE = 'config.json'
+CHUNK_SIZE = 50000 
 
 # --- Funciones de Control ---
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
     with open(LOG_FILE, 'w', encoding='utf-8') as f: 
-        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] [Paso 6] Iniciando Generación de Reportes...\n")
+        f.write(f"[Paso 6] Iniciando Generación de Reportes...\n")
 
 def log_message(msg):
     print(msg); sys.stdout.flush()
     try:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"); f.flush(); os.fsync(f.fileno())
+            f.write(f"{msg}\n"); f.flush(); os.fsync(f.fileno())
     except: pass
 
 def check_pause():
@@ -57,25 +52,56 @@ def save_metrics(df, main_output, created_files):
         "memory_mb": round(df.memory_usage(deep=True).sum() / 1024**2, 2),
         "columns_list": list(df.columns),
         "output_file": main_output, 
-        "created_files": created_files, 
+        "created_files": created_files,
         "preview": preview,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     with open(METRICS_FILE, 'w', encoding='utf-8') as f: json.dump(metrics, f, indent=2)
 
-def safe_load(path, log_error=True):
+def safe_load(path):
     if not os.path.exists(path):
-        if log_error: log_message(f"ERROR: No encontrado {path}")
-        return None
+        log_message(f"ERROR: No encontrado {path}"); return None
     try: return pd.read_parquet(path)
     except Exception as e:
         log_message(f"ERROR leyendo {path}: {e}"); return None
 
+def log_memory():
+    mem = psutil.virtual_memory().percent
+    return f"(RAM: {mem}%)"
+
+# --- FUNCIÓN DE ESCRITURA POR LOTES (Master CSV) ---
+def save_csv_chunked(df, path, sep=';', encoding='windows-1252'):
+    """Guarda un CSV grande reportando progreso para no parecer colgado."""
+    total_rows = len(df)
+    chunks = math.ceil(total_rows / CHUNK_SIZE)
+    
+    log_message(f"    -> Iniciando exportación de {total_rows:,} filas en {chunks} lotes...")
+    
+    # 1. Escribir cabecera (Modo 'w')
+    with open(path, 'w', encoding=encoding, newline='') as f:
+        df.head(0).to_csv(f, sep=sep, index=False)
+    
+    # 2. Escribir datos por lotes (Modo 'a')
+    for i in range(chunks):
+        check_pause() 
+        start_idx = i * CHUNK_SIZE
+        end_idx = min((i + 1) * CHUNK_SIZE, total_rows)
+        
+        chunk = df.iloc[start_idx:end_idx].copy()
+        
+        # Guardado del chunk
+        chunk.to_csv(path, sep=sep, encoding=encoding, index=False, header=False, mode='a', errors='replace')
+        
+        del chunk
+        gc.collect() # Liberar memoria entre lotes
+        
+        percent = int((end_idx / total_rows) * 100)
+        log_message(f"      [{percent}%] Guardado lote {i+1}/{chunks} (filas {start_idx}-{end_idx}) {log_memory()}")
+
 # --- Lógica Principal ---
 def run_step_6_main():
-    start_time_total = time.time()
     setup_logging()
-    log_message("[Paso 6] Generando Reportes Finales (Excel/CSV)...")
+    log_message("[Paso 6] Generando Reportes...")
     
     paths = load_paths()
     analytical_dir = paths.get('intermediate_analytical')
@@ -84,103 +110,91 @@ def run_step_6_main():
     
     # 1. CARGA
     check_pause()
-    log_message("  1/4 Cargando Base Analítica (Atlas)...")
-    input_file_path = os.path.join(analytical_dir, 'data_final_comparativo.parquet')
-    df = safe_load(input_file_path)
+    log_message(f"  1/4 Cargando Atlas... {log_memory()}")
+    df = safe_load(os.path.join(analytical_dir, 'data_final_comparativo.parquet'))
     if df is None: 
-        log_message("ERROR CRITICO: Falta data_final_comparativo.parquet (Ejecutar Paso 3 primero)")
+        log_message("ERROR CRITICO: Falta data_final_comparativo.parquet")
         return
 
     created_files = []
-    input_files_used = ["data_final_comparativo.parquet"]
 
+    # --- PREPARACIÓN DE TIPOS Y MEMORIA ANTES DEL BLOQUEO CRÍTICO ---
+    log_message("  -> Normalizando tipos de datos a String (Prevención de Buffer Crash)...")
+    for col in df.select_dtypes(include=['category']).columns:
+        df[col] = df[col].astype(str)
+    gc.collect()
+    
     # 2. GENERACIÓN DE BASE MAESTRA (CSV)
     check_pause()
-    log_message("  2/4 Exportando Base Maestra (baseUnisaMixtoAcusatorio.csv)...")
+    log_message(f"  2/4 Exportando CSV Maestro (Grande)... {log_memory()}")
     
-    master_csv_name = "baseUnisaMixtoAcusatorio.csv"
-    master_csv_path = os.path.join(output_dir, master_csv_name)
+    master_name = "baseUnisaMixtoAcusatorio.csv"
+    master_path = os.path.join(output_dir, master_name)
     
     try:
-        # Convertimos 'category' a 'object' (string) para evitar errores de codificación
-        for col in df.select_dtypes(include=['category']).columns:
-            df[col] = df[col].astype(str)
-            
-        df.to_csv(master_csv_path, index=False, sep=';', encoding='latin-1', errors='replace')
-        created_files.append(master_csv_name)
-        log_message(f"    -> ¡Éxito! {master_csv_name}")
+        # Ejecución por lotes
+        save_csv_chunked(df, master_path, sep=';', encoding='windows-1252')
+        created_files.append(master_name)
+        log_message(f"    ✅ ¡CSV Maestro Terminado!")
     except Exception as e:
-        log_message(f"    ERROR guardando Base Maestra: {e}")
-
-    # 3. REPORTES JURISDICCIONALES
+        log_message(f"    ❌ ERROR CRITICO guardando CSV: {e}")
+        log_message("    [DIAGNÓSTICO] Falló el buffer de conversión (Se necesita más RAM).")
+        
+    # 3. REPORTES EXCEL
     check_pause()
-    log_message("  3/4 Generando Reportes Excel por Jurisdicción...")
+    log_message(f"  3/4 Generando Excels Jurisdiccionales... {log_memory()}")
 
     if 'jurisdiccion_para_implementacion' not in df.columns:
-        log_message("WARN: Columna 'jurisdiccion_para_implementacion' faltante. Saltando recortes.")
-    else:
-        reportes = {
-            "Rosario": df[
-                (df['jurisdiccion_para_implementacion'] == "Rosario") & 
-                (df['oficina_ingreso'] != "Noreste") # Lógica específica de R
-            ],
-            "Mendoza": df[df['jurisdiccion_para_implementacion'] == "Mendoza"],
-            "Salta": df[df['jurisdiccion_para_implementacion'] == "Salta"],
-            "GeneralRoca": df[df['jurisdiccion_para_implementacion'] == "General Roca"],
-            "ComodoroRivadavia": df[df['jurisdiccion_para_implementacion'] == "Comodoro Rivadavia"],
-        }
+        log_message("WARN: 'jurisdiccion_para_implementacion' faltante. Usando 'jurisdiccion_ingreso'.")
+        df['jurisdiccion_para_implementacion'] = df['jurisdiccion_ingreso']
 
-        for nombre, data in reportes.items():
-            if not data.empty:
-                fname = f"ParaReporte{nombre}.xlsx"
-                fpath = os.path.join(output_dir, fname)
-                log_message(f"    -> Generando {fname} ({len(data)} filas)...")
-                try:
-                    data.to_excel(fpath, index=False)
-                    created_files.append(fname)
-                except Exception as e:
-                    log_message(f"    ERROR guardando {fname}: {e}")
-            else:
-                log_message(f"    -> Saltando {nombre} (Sin datos).")
+    reportes = {
+        "Rosario": df[(df['jurisdiccion_para_implementacion'] == "Rosario") & (df['oficina_ingreso'] != "Noreste")],
+        "Mendoza": df[df['jurisdiccion_para_implementacion'] == "Mendoza"],
+        "Salta": df[df['jurisdiccion_para_implementacion'] == "Salta"],
+    }
 
-    # 4. REPORTE CONSOLIDADO
-    log_message("  4/4 Generando Reporte Consolidado (Implementadas)...")
-    
-    jurisdicciones_impl = ["Rosario", "Mendoza", "Salta", "General Roca", "Comodoro Rivadavia", "Mar del Plata"]
-    if 'jurisdiccion_para_implementacion' in df.columns:
-        df_impl = df[df['jurisdiccion_para_implementacion'].isin(jurisdicciones_impl)]
-    else:
-        df_impl = pd.DataFrame() # Dataframe vacío
-    
-    fname_impl = "ParaReporteImplementadas.xlsx"
-    fpath_impl = os.path.join(output_dir, fname_impl)
+    for nombre, data in reportes.items():
+        if not data.empty:
+            fname = f"ParaReporte{nombre}.xlsx"
+            fpath = os.path.join(output_dir, fname)
+            log_message(f"    -> Generando {fname} ({len(data)} filas)...")
+            try:
+                data.to_excel(fpath, index=False)
+                created_files.append(fname)
+            except Exception as e:
+                log_message(f"    ❌ ERROR guardando {fname}: {e}")
+        else:
+            log_message(f"    -> . {nombre} (Vacío)")
+
+    # 4. CONSOLIDADO
+    log_message(f"  4/4 Generando Consolidado Implementadas... {log_memory()}")
+    targets = ["Rosario", "Mendoza", "Salta", "General Roca", "Comodoro Rivadavia", "Mar del Plata"]
+    df_impl = df[df['jurisdiccion_para_implementacion'].isin(targets)]
     
     if not df_impl.empty:
-        log_message(f"    -> Guardando Consolidado ({len(df_impl)} filas)...")
+        fname_impl = "ParaReporteImplementadas.xlsx"
+        fpath_impl = os.path.join(output_dir, fname_impl)
         try:
             df_impl.to_excel(fpath_impl, index=False)
             created_files.append(fname_impl)
         except Exception as e:
-            log_message(f"    ERROR guardando consolidado: {e}")
-    else:
-        log_message("    -> Saltando Consolidado (Sin datos).")
+            log_message(f"    ❌ ERROR guardando consolidado: {e}")
     
-    # FINALIZACIÓN
     log_message(f"--- [Paso 6] FINALIZADO. {len(created_files)} archivos generados. ---")
     
-    save_metrics(df, master_csv_path, input_files_used)
+    save_metrics(df_impl if not df_impl.empty else df, master_path, created_files)
 
 if __name__ == "__main__":
+    os.makedirs(LOG_DIR, exist_ok=True)
     with open(RUNNING_FLAG, 'w') as f: f.write("running")
     try:
         run_step_6_main()
     except Exception as e:
-        try:
+        try: 
             with open(LOG_FILE, 'a') as f: f.write(f"\n[CRASH] {e}\n{traceback.format_exc()}\n")
         except: pass
         print(f"[CRASH] {e}")
     finally:
-        if os.path.exists(RUNNING_FLAG):
-            os.remove(RUNNING_FLAG)
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        if os.path.exists(RUNNING_FLAG): os.remove(RUNNING_FLAG)
+        if os.path.exists(PID_FILE): os.remove(PID_FILE)
