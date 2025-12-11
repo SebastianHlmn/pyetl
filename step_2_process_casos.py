@@ -1,3 +1,4 @@
+# step_2_process_casos.py
 """
 step_2_process_casos.py
 
@@ -82,12 +83,12 @@ def safe_load(path, log_error=True):
         if log_error: log_message(f"  -> ERROR Leyendo {path}: {e}")
         return None
 
-def load_paths():
+def load_config():
     if not os.path.exists(CONFIG_FILE): 
         log_message(f"ERROR: No se encontró {CONFIG_FILE}")
         return None
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f).get('paths')
+        return json.load(f)
 
 def optimize_memory(df):
     """Convierte columnas object a category para ahorrar RAM antes de guardar."""
@@ -124,10 +125,13 @@ def run_step_2_main():
     log_message("[Paso 2] Motor de Procesamiento Iniciado.")
     log_memory_usage()
     
-    paths_config = load_paths()
-    if not paths_config:
-        log_message("ERROR FATAL: Configuración de rutas inválida.")
+    config = load_config()
+    if not config:
+        log_message("ERROR FATAL: Configuración inválida.")
         return
+
+    paths_config = config.get('paths', {})
+    filters_config = config.get('filters', {})
 
     loaded_dir = paths_config.get('intermediate_loaded')
     processed_dir = paths_config.get('intermediate_processed')
@@ -184,6 +188,7 @@ def run_step_2_main():
     log_message("  3/5 Procesando lógica de negocio (IDs, Fechas)...")
 
     df_casos['numero'] = df_casos['numero'].astype(str)
+    # Lógica de caso original
     casos_originales = df_casos[~df_casos['numero'].str.contains('/INC', na=False, case=False)][['numero', 'FechaIngreso']]
     casos_originales = casos_originales.drop_duplicates(subset=['numero'])
     casos_originales = casos_originales.rename(columns={'FechaIngreso': 'FechaIngresoCasoIncidente'})
@@ -204,9 +209,15 @@ def run_step_2_main():
     for col in ['FechaIngreso', 'fechaactuacion', 'fechaaltaactuacion']:
         df_casos[col] = pd.to_datetime(df_casos[col], errors='coerce')
 
-    # Filtros de fecha (hardcodeados como en R, pero deberían venir de config.json)
-    fechaA = pd.to_datetime("2012-01-01")
-    fechaB = pd.to_datetime("2025-12-31")
+    # --- CORRECCIÓN: FILTROS DE FECHA DESDE CONFIG ---
+    fecha_start_str = filters_config.get("date_start", "2018-01-01")
+    fecha_end_str = filters_config.get("date_end", "2025-12-31")
+    
+    fechaA = pd.to_datetime(fecha_start_str)
+    fechaB = pd.to_datetime(fecha_end_str)
+    
+    log_message(f"  -> Aplicando filtro de fechas: {fechaA.date()} a {fechaB.date()}")
+
     df_casos = df_casos[df_casos['FechaIngreso'].between(fechaA, fechaB)]
     mask_fecha_act = (df_casos['fechaactuacion'].between(fechaA, fechaB)) | (df_casos['IdActuacion'].isna())
     df_casos = df_casos[mask_fecha_act]
@@ -246,6 +257,7 @@ def run_step_2_main():
     df_casos['unidadfiscal_actual'] = df_casos['fiscalia_actual']
     df_casos['unidadfiscal_actuacion'] = df_casos['fiscalia_actuacion']
 
+    # Optimización usando np.select en lugar de case_when anidado
     conds_ing = [df_casos['oficina_ingreso'] == 'Subsede ORAN', df_casos['oficina_ingreso'] == 'Subsede TARTAGAL']
     choices_ing = ['Subsede ORAN', 'Subsede TARTAGAL']
     df_casos['unidadfiscal_ingreso'] = np.select(conds_ing, choices_ing, default=df_casos['unidadfiscal_ingreso'])
@@ -301,3 +313,4 @@ if __name__ == "__main__":
     finally:
         if os.path.exists(RUNNING_FLAG): os.remove(RUNNING_FLAG)
         if os.path.exists(PID_FILE): os.remove(PID_FILE)
+# step_2_process_casos.py

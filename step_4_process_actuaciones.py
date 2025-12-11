@@ -1,9 +1,10 @@
+# step_4_process_actuaciones.py
 """
 step_4_process_actuaciones.py
 
-(Este era tu 'step_3_process_actuaciones.py')
 Filtra la base Atlas por Acusatorio, aplica filtros de fecha,
-cruza con personas (INNER JOIN) y calcula el 'EstadoInforme'.
+cruza con personas preservando actuaciones sin persona (Lógica R: Union All),
+y calcula el 'EstadoInforme'.
 """
 import pandas as pd
 import numpy as np
@@ -25,7 +26,7 @@ RUNNING_FLAG = os.path.join(LOG_DIR, "step_4.running")
 METRICS_FILE = os.path.join(LOG_DIR, "step_4_metrics.json")
 CONFIG_FILE = 'config.json'
 
-# --- Mapeo de Estados (COPIADO DE TU SCRIPT) ---
+# --- Mapeo de Estados ---
 ESTADOS_MAP = {
     "SentenciaCondenatoriaJuicio": ["Sentencia Condenatoria -juicio oral- (art. 305, CPPF)", "Sentencia Condenatoria Firme -juicio oral- (art. 305, CPPF)", "Sentencia Condenatoria (art. 305, CPPF)", "Sentencia Condenatoria Firme (art. 305, CPPF)"],
     "SentenciaCondenatoriaAcuerdoPleno": ["Sentencia Condenatoria -acuerdo pleno- (art. 325, CPPF)", "Sentencia Condenatoria Firme -acuerdo pleno- (art. 325, CPPF)", "Sentencia Condenatoria (art. 325, CPPF)", "Sentencia Condenatoria Firme (art. 325, CPPF)", "Acuerdo Pleno (Art. 323, CPPF)"],
@@ -129,22 +130,22 @@ def run_step_4_main():
     
     input_files_used = []
 
-    # 1. Cargar Atlas (Paso 3) y Filtros
+    # 1. Cargar Atlas (Paso 3)
     check_pause()
     log_message("  1/5 Cargando Atlas (Paso 3) y Aplicando Filtros...")
     
     df_atlas = safe_load(os.path.join(analytical_dir, 'data_final_comparativo.parquet'))
     if df_atlas is None:
-        log_message("ERROR CRITICO: Falta data_final_comparativo.parquet (Ejecutar Paso 3 primero)")
+        log_message("ERROR CRITICO: Falta data_final_comparativo.parquet")
         return
     input_files_used.append("data_final_comparativo.parquet")
 
-    # --- FILTRO ACUSATORIO ---
+    # Filtro Acusatorio
     initial_rows = len(df_atlas)
     df_casos = df_atlas[df_atlas['descripcion_sistemaprocesal'] == 'Acusatorio'].copy()
     log_message(f"  -> Filtro Acusatorio: {initial_rows:,} -> {len(df_casos):,} filas")
     
-    # --- FILTRO FECHAS ---
+    # Filtro Fechas
     if 'date_start' in filters and 'date_end' in filters:
         d_start = pd.to_datetime(filters['date_start'])
         d_end = pd.to_datetime(filters['date_end'])
@@ -152,64 +153,68 @@ def run_step_4_main():
         df_casos = df_casos[(df_casos['FechaIngreso'] >= d_start) & (df_casos['FechaIngreso'] <= d_end)]
         log_message(f"  -> Filtro Fechas ({d_start.date()} - {d_end.date()}): {len(df_casos):,} filas restantes")
 
-    if df_casos.empty:
-        log_message("⚠️ ADVERTENCIA: El dataset quedó vacío tras los filtros. Creando archivo vacío.")
-        # --- CORRECCIÓN DEL BUG ---
-        # Creamos un DF vacío pero con las columnas que el Paso 5 espera, para evitar el KeyError
-        columnas_esperadas = list(df_atlas.columns) + ['IdPersona', 'IdDelito', 'fuente_datos_actuacion', 'EstadoInforme']
-        # Nos aseguramos de que no haya columnas duplicadas si ya existían
-        columnas_finales_unicas = list(dict.fromkeys(columnas_esperadas)) 
-        df_final = pd.DataFrame(columns=columnas_finales_unicas)
-        del df_atlas
-        # --- FIN CORRECCIÓN ---
-    else:
-        del df_atlas; gc.collect()
+    del df_atlas; gc.collect()
 
-        # 2. Cargar Personas (para el INNER JOIN)
+    if df_casos.empty:
+        log_message("⚠️ ADVERTENCIA: Dataset vacío. Generando archivo dummy.")
+        df_final = pd.DataFrame(columns=['IdCaso', 'IdPersona', 'EstadoInforme', 'fuente_datos_actuacion'])
+    else:
+        # 2. Cargar Personas
         check_pause()
         log_message("  2/5 Cargando Personas...")
         df_personas = safe_load(os.path.join(loaded_dir, 'df_persona_actuacion_delito.parquet'), log_error=False)
-        if df_personas is None:
-            log_message("ERROR CRITICO: Sin archivo de personas.")
-            return
         input_files_used.append("df_persona_actuacion_delito.parquet")
         
-        # 3. Join (INNER JOIN de R)
+        # 3. Join Híbrido (Con Persona + Sin Persona)
         check_pause()
-        log_message("  3/5 Cruzando Casos Acusatorio con Personas (INNER)...")
+        log_message("  3/5 Cruzando Casos con Personas (Recuperando 'Sin Persona')...")
         
-        df_final = pd.merge(
-            df_casos, 
-            df_personas, 
-            on='IdActuacion', 
-            how='inner',
-            suffixes=('', '_per')
-        )
-        
-        # Limpiar columnas duplicadas del merge
-        cols_to_drop = [c for c in df_final.columns if c.endswith('_per')]
-        df_final.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+        if df_personas is not None:
+            # RAMA A: Con Persona (INNER JOIN)
+            log_message("    -> Generando rama 'con_persona'...")
+            df_con_persona = pd.merge(
+                df_casos, 
+                df_personas, 
+                on='IdActuacion', 
+                how='inner',
+                suffixes=('', '_per')
+            )
+            df_con_persona['fuente_datos_actuacion'] = 'con_persona'
+            
+            # Limpieza de duplicadas por merge
+            cols_to_drop = [c for c in df_con_persona.columns if c.endswith('_per')]
+            df_con_persona.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+            if 'IdPersona_x' in df_con_persona.columns:
+                df_con_persona['IdPersona'] = df_con_persona['IdPersona_y'].fillna(df_con_persona['IdPersona_x'])
+                df_con_persona.drop(columns=['IdPersona_x', 'IdPersona_y'], inplace=True, errors='ignore')
+            if 'IdDelito_x' in df_con_persona.columns:
+                df_con_persona['IdDelito'] = df_con_persona['IdDelito_y'].fillna(df_con_persona['IdDelito_x'])
+                df_con_persona.drop(columns=['IdDelito_x', 'IdDelito_y'], inplace=True, errors='ignore')
 
-        if 'IdPersona_x' in df_final.columns:
-            df_final['IdPersona'] = df_final['IdPersona_y'].fillna(df_final['IdPersona_x'])
-            df_final.drop(columns=['IdPersona_x', 'IdPersona_y'], inplace=True, errors='ignore')
-        
-        if 'IdDelito_x' in df_final.columns:
-            df_final['IdDelito'] = df_final['IdDelito_y'].fillna(df_final['IdDelito_x'])
-            df_final.drop(columns=['IdDelito_x', 'IdDelito_y'], inplace=True, errors='ignore')
+            # RAMA B: Sin Persona (ANTI JOIN implícito)
+            log_message("    -> Generando rama 'sin_persona'...")
+            actuaciones_con_persona = df_personas['IdActuacion'].unique()
+            df_sin_persona = df_casos[~df_casos['IdActuacion'].isin(actuaciones_con_persona)].copy()
+            df_sin_persona['fuente_datos_actuacion'] = 'sin_persona'
+            
+            # Unir (Union All)
+            log_message("    -> Uniendo ramas...")
+            df_final = pd.concat([df_con_persona, df_sin_persona], ignore_index=True)
+            
+            del df_con_persona, df_sin_persona, df_personas
+        else:
+            log_message("    -> Sin tabla de personas, todo es 'sin_persona'.")
+            df_final = df_casos.copy()
+            df_final['fuente_datos_actuacion'] = 'sin_persona'
 
-        df_final['fuente_datos_actuacion'] = "con_persona"
-        
-        del df_personas, df_casos
+        del df_casos
         gc.collect()
-        log_message(f"  -> Dataset filtrado: {len(df_final):,} filas")
-        log_memory_usage()
+        log_message(f"  -> Dataset unificado: {len(df_final):,} filas")
 
         # 4. Clasificación (EstadoInforme)
         check_pause()
         log_message("  4/5 Aplicando Clasificación de Estados...")
         
-        # Invertir el mapeo para búsqueda rápida
         desc_to_estado_map = {}
         for estado, descripciones in ESTADOS_MAP.items():
             for desc in descripciones:
@@ -219,7 +224,6 @@ def run_step_4_main():
         df_final['EstadoInforme'] = df_final['descripcionactuacion'].map(desc_to_estado_map).fillna("Otros Estados")
         
         mask_rechazo = df_final['descripcionactuacion'] == "Decisión que rechaza revisión de víctima por aplicación de crit. de oport. (252, 4to. párr., CPPF)"
-        
         if mask_rechazo.any():
             df_final.loc[mask_rechazo, 'EstadoInforme'] = "Criterio Oportunidad- Rechazado por el Fiscal Revisor"
 
@@ -247,3 +251,4 @@ if __name__ == "__main__":
     finally:
         if os.path.exists(RUNNING_FLAG): os.remove(RUNNING_FLAG)
         if os.path.exists(PID_FILE): os.remove(PID_FILE)
+# step_4_process_actuaciones.py

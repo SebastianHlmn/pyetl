@@ -199,7 +199,7 @@ status = check_status(st.session_state.config.get('paths', {}))
 for i in range(1, 7):
     if status.get(f'step_{i}_running'): st.session_state.inspector_step = i
 
-# --- ORQUESTADOR (LÓGICA DE LOTE RESTAURADA) ---
+# --- ORQUESTADOR (LÓGICA DE LOTE) ---
 if st.session_state.pipeline_active:
     if st.session_state.pipeline_queue:
         next_step = st.session_state.pipeline_queue[0]
@@ -232,23 +232,12 @@ if st.session_state.pipeline_active:
                 script = ctrl['script']
                 if os.path.exists(log_file): os.remove(log_file)
                 
-                # Manejo sincrónico para Paso 1
-                if next_step == 1:
-                    with open(ctrl['running'], 'w') as f: f.write('running')
-                    try: 
-                        import step_1_load_raw_data
-                        step_1_load_raw_data.run_step_1(st.session_state.config['paths'], 'temp')
-                    except Exception as e: st.error(f"Error Paso 1: {e}")
-                    os.remove(ctrl['running']) 
-                else:
-                    with open(ctrl['running'], 'w') as f: f.write('running')
-                    subprocess.Popen([sys.executable, script])
+                with open(ctrl['running'], 'w') as f: f.write('running')
+                subprocess.Popen([sys.executable, script])
                 
                 st.session_state.current_pipeline_step = next_step
                 st.toast(f"🚀 Iniciando Paso {next_step}...")
                 time.sleep(1); st.rerun()
-    
-    time.sleep(2); st.rerun()
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -305,7 +294,7 @@ with st.sidebar:
     if st.button("Guardar"):
         save_config(st.session_state.config, nn if nn.endswith('.json') else nn+".json")
         st.success("Guardado")
-
+        
     with st.expander("✏️ Editar Rutas"):
         with st.form("edit_paths"):
             paths = st.session_state.config.get('paths', {})
@@ -371,8 +360,8 @@ with col_pipe:
                     st.rerun()
 
             if os.path.exists(ctrl['log']):
-                st.markdown("**Log:**")
-                st.code(read_log_tail(ctrl['log'], n=50), language="log") # N=50 para ver más contexto
+                st.markdown("**Log de Ejecución:**")
+                st.code(read_log_tail(ctrl['log'], n=50), language="log")
 
     # Renderizar Pasos
     render_step_card(1, True)
